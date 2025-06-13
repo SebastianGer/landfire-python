@@ -15,9 +15,9 @@ from landfire.product.search import ProductSearch
 __all__ = ["landfire"]
 
 # URLs for making requests to LANDFIRE ArcGIS Rest Service
-BASE_URL = "https://lfps.usgs.gov/arcgis/rest/services/LandfireProductService/GPServer/LandfireProductService"
-REQUEST_URL = BASE_URL + "/submitJob?"
-JOB_URL = BASE_URL + "/jobs/"
+BASE_URL = "https://lfps.usgs.gov/api/job/"
+REQUEST_URL = BASE_URL + "submit?"
+JOB_URL = BASE_URL + "status?JobId="
 
 
 @define
@@ -28,14 +28,17 @@ class Landfire:
         bbox: Bounding box with form `min_x min_y max_x max_y`. For example, `-107.70894965 46.56799094 -106.02718124 47.34869094`. Use geospatial util func `get_bbox_from_polygon()` to convert a GeoJSON Polygon object or get_bbox_from_file() to convert a file to a suitable bounding box if needed.
         output_crs: Output coordinate reference system in well-known integer ID (WKID) format (EPSG). Defaults to None to preserve localized Albers projection from LANDFIRE needed for most fire models (FlamMap, FARSITE, etc.). A commonly used value for other purposes is `4326` for WGS84. See https://epsg.io for a full list of EPSG WKIDs.
         resample_res: Resolution in meters for resampling output data. Defaults to 30 meters. Acceptable values are 30 to 9999 meters.
+        email: Email address of the user requesting an LFPS product
     """
 
     bbox: str = field(validator=validators.instance_of(str))
+    email: str = field(validator=validators.instance_of(str))
     resample_res: int = field(default=30, validator=validators.instance_of(int))
     output_crs: Union[str, None] = field(
         default=None,
         validator=validators.optional(validators.instance_of(str)),
     )
+
     # Private attrs that will be set in post_init()
     _search = field(init=False, validator=validators.instance_of(ProductSearch))
     _all_layers = field(init=False, validator=validators.instance_of(list))
@@ -52,9 +55,10 @@ class Landfire:
 
         # base param payload
         self._base_params = {
-            "Area_Of_Interest": self.bbox,
+            "Area_of_Interest": self.bbox,
             "Output_Projection": self.output_crs,
             "f": "JSON",
+            "Email": self.email,
         }
 
         # api will fail if 30 is provided to Resample_Resolution. Handle here instead of confusing  user to provide None when they want 30m.
@@ -200,14 +204,14 @@ class Landfire:
         # Get job id, check status of processing with backoff
         if "jobId" in submit_job_req:
             job_id = submit_job_req["jobId"]
-            status = submit_job_req["jobStatus"]
+            status = submit_job_req["status"]
 
             pbar.update(25)
             self._write_status("Job submitted! Processing layers...", pbar, show_status)
 
             job_url = JOB_URL + job_id
             n = 0
-            while status == "esriJobSubmitted" or status == "esriJobExecuting":
+            while status == "Submitted" or status == "Executing" or status == "Pending":
                 # Backoff logic
                 n += 1
                 backoff_sec = backoff_base_value * n
@@ -223,8 +227,8 @@ class Landfire:
                     url=job_url, params={"f": "json"}, stream=False
                 ).json()
 
-                if "jobStatus" in status_job_req:
-                    status = status_job_req["jobStatus"]
+                if "status" in status_job_req:
+                    status = status_job_req["status"]
                     # Get latest processing status
                     if status_job_req["messages"]:
                         latest_status_msg = status_job_req["messages"][-1][
@@ -234,23 +238,9 @@ class Landfire:
                         latest_status_msg = "No message yet!"
 
                     # Obtain data results url
-                    if status == "esriJobSucceeded":
-                        data_path = status_job_req["results"]["Output_File"]["paramUrl"]
-                        results_url = job_url + "/" + data_path
-
+                    if status == "Succeeded":
+                        zip_url = status_job_req["outputFile"]
                         pbar.update(25)
-                        self._write_status(
-                            "Job complete! Getting path to .zip file...",
-                            pbar,
-                            show_status,
-                        )
-
-                        # Get zip file url
-                        data_job_req = self._submit_request(
-                            results_url, params={"f": "json"}, stream=False
-                        ).json()
-                        zip_url = data_job_req["value"]["url"]
-
                         pbar.update(25)
                         self._write_status(
                             "Downloading data as .zip file...",
@@ -272,11 +262,7 @@ class Landfire:
                         pbar.close()
 
                     # Still executing, display most recent processing step
-                    elif status in (
-                        "esriJobExecuting",
-                        "esriJobSubmitted",
-                        "esriJobWaiting",
-                    ):
+                    elif status in ("Executing", "Submitted", "JobWaiting", "Pending"):
                         self._write_status(
                             f"Most recent message is `{latest_status_msg}`",
                             pbar,
